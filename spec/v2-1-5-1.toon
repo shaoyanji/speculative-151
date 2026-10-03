@@ -1,0 +1,40 @@
+# toon: v2 1-N-1 speculative-decoding protocol — canonical declarative spec
+# shape: 1 orchestrator -> N parallel stateless candidates -> jev noul batch -> argmax ships unfiltered
+# invariants: N>=2 (N=1 invalid: nothing to judge), no grader, no decider, no orchestrator tool calls
+# parse: read line, strip indent, jq '{...}' rows. see lib/toon.sh
+
+protocol: v2
+shape: 1-N-1
+default_slots: 5
+min_slots: 2
+max_slots: 25
+invariants: [stateless-orchestrator, stateless-candidates, no-tool-calls-orchestrator, no-grader, no-decider, clean-prompts, argmax-unfiltered, min-slots-2]
+
+candidates[N]{slot,variable,purpose,budget}:
+  1,direct,anchor reading of prompt,1 sentence
+  2,technical,mechanism and precision,1-2 sentences
+  3,dry-humor,register match no sycophancy,1 sentence
+  4,minimal,cheapest correct answer,fewest words
+  5,blunt,mirror user register,1 sentence
+
+# variables cycle when N > len(variables); fixed menu keeps diversity reproducible
+variable_menu{prompt_type,slot1,slot2,slot3}:
+  factual,terse,elaborated,example-first
+  open-ended,plain,warm,provocative
+  ambiguous,literal-reading,most-likely-intent,ask-back
+
+decode[1]{stage,input,call,select,emit,threshold}:
+  jev-decode,N candidate texts,jevq --batch items.json (noul "Is this the best response?"),argmax score JSON,winner text verbatim to response unfiltered,discriminate: top-two gap >= 0.05 else NO_RESULT
+
+# parallel-edit mode: candidates emit git unified diffs; jev grades the diff, not prose
+parallel_edits{mode,output,grade}:
+  git-patch,unified diff per candidate,jev noul "Is this the best change?" over diffs
+
+# guardrails (see lib/guardrails.sh, bin/v2-scaffold, bin/v2-score)
+guardrails{rule,value,reason}:
+  min_slots,2,N=1 has nothing to judge; argmax is a no-op
+  max_slots,25,cost control; warn above 10
+  prompt_max_chars,8000,bound jevq input cost
+  candidate_timeout_s,120,judge never waits indefinitely
+  discrimination_threshold,0.05,top-two gap below this -> NO_RESULT not a crowned tie
+  ledger,ledger.jsonl,every run appends prompt hash + scores + winner; trust is checkable

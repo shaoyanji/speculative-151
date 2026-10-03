@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# v2-score — score v2 1-N-1 candidates with Jev and pick the winner.
+#
+# Input:  candidates JSON — either [{"slot":1,"text":"..."},...] or {"1":"...","2":"..."}
+# Output: score JSON on stdout:
+#   {"scores":{"1":0.72,...},"winner":1,"margin":0.08,"decision":"SHIP","threshold":0.05}
+# Exit 0 on SHIP, 3 on NO_RESULT (top-two gap < threshold: do not crown a tie),
+# 2 on usage/validation errors, 4 if jevq failed.
+#
+# Guardrails: >= 2 non-empty candidates required; per-call timeout; empty
+# texts are skipped (not scored); batch p's run hot — treat as upper bound.
+#
+# Usage:
+#   v2-score --candidates cands.json [--question "..."] [--state "..."]
+#            [--threshold 0.05] [--timeout 120] [--ledger ledger.jsonl]
+#
+#   jq -r '.winner'                  # winning slot
+#   jq -r '.decision'                # SHIP or NO_RESULT
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/guardrails.sh
+source "$SCRIPT_DIR/../lib/guardrails.sh"
+
+CANDIDATES=""
+QUESTION="Is this the best response?"
+STATE=""
+THRESHOLD="0.05"
+TIMEOUT_S=120
+LEDGER=""
+
+usage() {
+  cat <<'EOF'
+Usage: v2-score --candidates FILE [--question Q] [--state S] [--threshold T] [--timeout SEC] [--ledger FILE]
+
+  --candidates  JSON file: [{"slot":1,"text":"..."},...] or {"1":"...","2":"..."} (required)
+  --question    noul question per candidate (default: "Is this the best response?")
+  --state       shared state passed to jevq as positional (default: none)
+  --threshold   min top-two gap to SHIP; below -> NO_RESULT exit 3 (default: 0.05)
+  --timeout     seconds for the jevq call (default: 120; judge never waits indefinitely)
+  --ledger      append audit JSONL line to FILE
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --candidates) CANDIDATES="${2:?--candidates needs a value}"; shift 2 ;;
+    --question)   QUESTION="${2:?--question needs a value}"; shift 2 ;;
+    --state)      STATE="${2:?--state needs a value}"; shift 2 ;;
+    --threshold)  THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
+    --timeout)    TIMEOUT_S="${2:?--timeout needs a value}"; shift 2 ;;
+    --ledger)     LEDGER="${2:?--ledger needs a value}"; shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$CANDIDATES" ]] || { echo "error: --candidates is required" >&2; exit 2; }
+[[ -f "$CANDIDATES" ]] || { echo "error: candidates file not found: $CANDIDATES" >&2; exit 2; }
+THRESHOLD="$(guard_threshold "$THRESHOLD")" || exit 2
+[[ "$TIMEOUT_S" =~ ^[0-9]+$ ]] && (( TIMEOUT_S > 0 )) || {
+  echo "error: --timeout must be a positive integer" >&2; exit 2; }
+command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
+command -v jevq >/dev/null || { echo "error: jevq not found on PATH (~/bin/jevq)" >&2; exit 2; }
+
+TMPDIR_WORK="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+# Normalize candidates to [{"slot":N,"text":"..."}], dropping empty texts.
+jq -c '
+  if type == "array" then
+    [.[] | select(.text != null and (.text | tostring | ltrimstr(" ") | rtrimstr(" ") | length > 0))
+         | {slot: (.slot | tonumber), text: (.text | tostring)}]
+  elif type == "object" then
+    [to_entries[] | select(.value != null and (.value | tostring | ltrimstr(" ") | rtrimstr(" ") | length > 0))
+         | {slot: (.key | tonumber), text: (.value | tostring)}]
+  else empty end
+  | sort_by(.slot)
+' "$CANDIDATES" > "$TMPDIR_WORK/cands.json"
+
+NVALID="$(jq 'length' "$TMPDIR_WORK/cands.json")"
+if (( NVALID < 2 )); then
+  echo "error: need >= 2 non-empty candidates to judge, got $NVALID" >&2
+  exit 2
+fi
+
+# Build jevq batch items: [{"id":"<slot>","q":"..."}]
+jq -c --arg q "$QUESTION" '
+  map({id: (.slot | tostring),
+       q: ("Candidate " + (.slot | tostring) + " response:\n" + .text + "\n\n" + $q)})
+' "$TMPDIR_WORK/cands.json" > "$TMPDIR_WORK/items.json"
+
+# Score in one parallel jevq pass, bounded by timeout.
+if [[ -n "$STATE" ]]; then
+  if ! timeout "$TIMEOUT_S" jevq "$STATE" --batch @"$TMPDIR_WORK/items.json" > "$TMPDIR_WORK/resp.json" 2>"$TMPDIR_WORK/jevq.err"; then
+    echo "error: jevq failed or timed out after ${TIMEOUT_S}s" >&2
+    cat "$TMPDIR_WORK/jevq.err" >&2 || true
+    exit 4
+  fi
+else
+  if ! timeout "$TIMEOUT_S" jevq --batch @"$TMPDIR_WORK/items.json" > "$TMPDIR_WORK/resp.json" 2>"$TMPDIR_WORK/jevq.err"; then
+    echo "error: jevq failed or timed out after ${TIMEOUT_S}s" >&2
+    cat "$TMPDIR_WORK/jevq.err" >&2 || true
+    exit 4
+  fi
+fi
+
+# Extract {slot: p} from .answers.<id>.noul
+jq -c '
+  (.answers // {}) | with_entries(.value |= (.noul // 0))
+' "$TMPDIR_WORK/resp.json" > "$TMPDIR_WORK/scores.json"
+
+# Rank, margin, decision.
+RESULT="$(jq -c --argjson t "$THRESHOLD" '
+  to_entries | sort_by(-.value) as $r
+  | ($r[0]) as $top | ($r[1]) as $second
+  | (($top.value - ($second.value // 0))) as $margin
+  | {
+      scores: (from_entries),
+      winner: ($top.key | tonumber),
+      margin: $margin,
+      threshold: $t,
+      decision: (if $margin < $t then "NO_RESULT" else "SHIP" end)
+    }
+' "$TMPDIR_WORK/scores.json")"
+
+echo "$RESULT" | jq .
+
+if [[ -n "$LEDGER" ]]; then
+  TS="$(date +%s)"
+  echo "$RESULT" | jq -c --argjson ts "$TS" --argjson n "$NVALID" \
+    '{ts: $ts, n_candidates: $n} + .' >> "$LEDGER"
+fi
+
+DECISION="$(echo "$RESULT" | jq -r '.decision')"
+[[ "$DECISION" == "SHIP" ]] || exit 3

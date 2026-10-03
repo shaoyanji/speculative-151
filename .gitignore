@@ -1,0 +1,4 @@
+*.log
+ledger.jsonl
+/tmp/
+.DS_Store

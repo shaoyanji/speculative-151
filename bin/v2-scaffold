@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+#
+# v2-scaffold — scaffold the v2 1-N-1 speculative-decoding dispatch spec.
+#
+# Reads a scaffold template (embedded default, or --template FILE) and fills
+# in CLI flags. Emits a TOON dispatch spec: headers + one row per slot.
+# Each row carries: slot, variable, expanded_prompt.
+#
+# Guardrails (lib/guardrails.sh): slots in [2,25] (N=1 has nothing to judge),
+# prompt <= 8000 chars, variables in [A-Za-z0-9_-].
+#
+# Usage:
+#   v2-scaffold --prompt "Why is the sky blue?" \
+#     [--variables brief,technical,humor,minimal,blunt] \
+#     [--slots 5] [--template FILE] [--json]
+#
+# TOON output embeds a `# json:` line holding the same spec as compact JSON:
+#   v2-scaffold --prompt "..." | grep '^# json: ' | sed 's/^# json: //' | jq .
+# Pass --json for pure JSON on stdout (straight into jq).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/guardrails.sh
+source "$SCRIPT_DIR/../lib/guardrails.sh"
+
+PROMPT=""
+VARIABLES="brief,technical,humor,minimal,blunt"
+SLOTS=5
+TEMPLATE_FILE=""
+AS_JSON=0
+
+usage() {
+  cat <<'EOF'
+Usage: v2-scaffold --prompt "..." [--variables a,b,c] [--slots N] [--template FILE] [--json]
+
+  --prompt      the user message to fan out (required, <= 8000 chars)
+  --variables   comma-separated slot variables (default: brief,technical,humor,minimal,blunt)
+  --slots       number of candidate rows, 2..25 (default: 5); variables cycle to fill slots
+  --template    scaffold template file; placeholders {SLOT} {VAR} {VAR_UPPER} {PROMPT} {FRAGMENT}
+  --json        emit pure JSON instead of TOON (jq-parseable)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)     PROMPT="${2:?--prompt needs a value}"; shift 2 ;;
+    --variables)  VARIABLES="${2:?--variables needs a value}"; shift 2 ;;
+    --slots)      SLOTS="${2:?--slots needs a value}"; shift 2 ;;
+    --template)   TEMPLATE_FILE="${2:?--template needs a value}"; shift 2 ;;
+    --json)       AS_JSON=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# --- guardrailed inputs -----------------------------------------------------
+PROMPT="$(guard_prompt "$PROMPT")"         || exit 2
+VARIABLES="$(guard_variables "$VARIABLES")" || exit 2
+SLOTS="$(guard_slots "$SLOTS")"           || exit 2
+
+DEFAULT_TEMPLATE='User message: {PROMPT} || Variable: {VAR_UPPER}. {FRAGMENT}'
+if [[ -n "$TEMPLATE_FILE" ]]; then
+  [[ -f "$TEMPLATE_FILE" ]] || { echo "error: template not found: $TEMPLATE_FILE" >&2; exit 2; }
+  TEMPLATE="$(<"$TEMPLATE_FILE")"
+else
+  TEMPLATE="$DEFAULT_TEMPLATE"
+fi
+
+# variable -> expansion fragment appended to the scaffold template
+var_fragment() {
+  case "$1" in
+    brief)     printf 'Answer plainly and briefly. One short sentence.' ;;
+    technical) printf 'Answer precisely. One or two sentences, concrete terms.' ;;
+    humor)     printf 'Answer with dry wit. One short sentence, no defensiveness.' ;;
+    minimal)   printf 'Answer in the fewest words possible.' ;;
+    blunt)     printf "Answer directly, in the user's register. One short sentence." ;;
+    *)         printf 'Answer the prompt. One short sentence.' ;;
+  esac
+}
+
+# fill scaffold placeholders
+expand() { # slot var prompt fragment
+  local slot="$1" var="$2" prompt="$3" frag="$4"
+  local t="$TEMPLATE"
+  t="${t//\{SLOT\}/$slot}"
+  t="${t//\{VAR\}/$var}"
+  t="${t//\{VAR_UPPER\}/${var^^}}"
+  t="${t//\{PROMPT\}/$prompt}"
+  t="${t//\{FRAGMENT\}/$frag}"
+  printf '%s' "$t"
+}
+
+csv_escape() {
+  local s="$1"
+  case "$s" in
+    *\"*|*,*|*$'\n'*)
+      s="${s//\"/\"\"}"
+      printf '"%s"' "$s"
+      ;;
+    *) printf '%s' "$s" ;;
+  esac
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+IFS=',' read -ra VAR_LIST <<< "$VARIABLES"
+NVAR="${#VAR_LIST[@]}"
+
+toon_rows=()
+json_rows=""
+json_vars=""
+for v in "${VAR_LIST[@]}"; do
+  json_vars+="\"$(json_escape "$v")\","
+done
+json_vars="${json_vars%,}"
+
+for ((i = 1; i <= SLOTS; i++)); do
+  var="${VAR_LIST[$(((i - 1) % NVAR))]}"
+  frag="$(var_fragment "$var")"
+  expanded="$(expand "$i" "$var" "$PROMPT" "$frag")"
+  toon_rows+=("  $i,$(csv_escape "$var"),$(csv_escape "$expanded")")
+  json_rows+="{\"slot\":$i,\"variable\":\"$(json_escape "$var")\",\"expanded_prompt\":\"$(json_escape "$expanded")\"},"
+done
+json_rows="${json_rows%,}"
+
+json_doc="{\"protocol\":\"v2\",\"shape\":\"1-${SLOTS}-1\",\"slots\":${SLOTS},\"prompt_sha\":\"$(prompt_sha "$PROMPT")\",\"variables\":[${json_vars}],\"rows\":[${json_rows}],\"decode\":{\"method\":\"jev-noul-batch\",\"question\":\"Is this the best response?\",\"select\":\"argmax\",\"emit\":\"winner text verbatim to response, unfiltered\"}}"
+
+if [[ "$AS_JSON" -eq 1 ]]; then
+  printf '%s\n' "$json_doc"
+  exit 0
+fi
+
+SHAPE="1-${SLOTS}-1"
+printf '# toon: v2 %s dispatch spec\n' "$SHAPE"
+printf '# shape: 1 orchestrator -> %s candidates -> jev noul batch -> argmax ships unfiltered\n' "$SLOTS"
+printf '# json: %s\n' "$json_doc"
+printf 'prompt_sha: %s\n' "$(prompt_sha "$PROMPT")"
+printf 'dispatch[%s]{slot,variable,expanded_prompt}:\n' "$SLOTS"
+printf '%s\n' "${toon_rows[@]}"
+printf '# decode: jevq noul "Is this the best response?" --batch rows.json | jq -r "to_entries | max_by(.value) | .key"\n'

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# v2-ledger — append one audit line (JSONL) to the protocol ledger.
+# "Trust the process" is only meaningful if the process is checkable.
+#
+# Usage:
+#   v2-ledger --prompt "..." --slots 5 --variables a,b,c \
+#             --scores '{"1":0.7,"2":0.4}' --winner 1 --margin 0.3 \
+#             --decision SHIP [--ledger ledger.jsonl]
+#
+# Ledger line:
+#   {"ts":...,"prompt_sha":"...","slots":5,"variables":[...],
+#    "scores":{...},"winner":1,"margin":0.3,"decision":"SHIP","threshold":0.05}
+# The prompt itself is never logged — only its sha256.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/guardrails.sh
+source "$SCRIPT_DIR/../lib/guardrails.sh"
+
+PROMPT=""; SLOTS=""; VARIABLES=""; SCORES=""; WINNER=""
+MARGIN=""; DECISION=""; THRESHOLD="0.05"; LEDGER="${SPECULATIVE_151_LEDGER:-ledger.jsonl}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)    PROMPT="${2:?--prompt needs a value}"; shift 2 ;;
+    --slots)     SLOTS="${2:?--slots needs a value}"; shift 2 ;;
+    --variables) VARIABLES="${2:?--variables needs a value}"; shift 2 ;;
+    --scores)    SCORES="${2:?--scores needs a value}"; shift 2 ;;
+    --winner)    WINNER="${2:?--winner needs a value}"; shift 2 ;;
+    --margin)    MARGIN="${2:?--margin needs a value}"; shift 2 ;;
+    --decision)  DECISION="${2:?--decision needs a value}"; shift 2 ;;
+    --threshold) THRESHOLD="${2:?--threshold needs a value}"; shift 2 ;;
+    --ledger)    LEDGER="${2:?--ledger needs a value}"; shift 2 ;;
+    -h|--help)   echo "usage: v2-ledger --prompt P --slots N --variables V --scores JSON --winner N --margin M --decision D [--threshold T] [--ledger FILE]"; exit 0 ;;
+    *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+for req in PROMPT SLOTS VARIABLES SCORES WINNER MARGIN DECISION; do
+  [[ -n "${!req}" ]] || { echo "error: --${req,,} is required" >&2; exit 2; }
+done
+command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
+
+jq -c -n \
+  --argjson ts "$(date +%s)" \
+  --arg sha "$(prompt_sha "$PROMPT")" \
+  --argjson slots "$SLOTS" \
+  --arg vars "$VARIABLES" \
+  --argjson scores "$SCORES" \
+  --argjson winner "$WINNER" \
+  --argjson margin "$MARGIN" \
+  --arg decision "$DECISION" \
+  --argjson threshold "$THRESHOLD" \
+  '{ts:$ts, prompt_sha:$sha, slots:$slots,
+    variables:($vars|split(",")), scores:$scores,
+    winner:$winner, margin:$margin, decision:$decision, threshold:$threshold}' \
+  >> "$LEDGER"
+
+echo "ledger: appended to $LEDGER"
