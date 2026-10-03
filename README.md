@@ -55,7 +55,8 @@ bin/v2-scaffold --prompt "Why is the sky blue?" --slots 5
 
 # 3. collect responses -> candidates.json, then score
 bin/v2-score --candidates candidates.json --ledger ledger.jsonl
-# -> {"scores":{"1":0.72,...},"winner":1,"margin":0.08,"decision":"SHIP","threshold":0.05}
+# -> {"raw_scores":{"1":0.81,...},"grades":{"1":1.0,...},"scores":{"1":0.81,...},
+#     "winner":1,"margin":0.08,"threshold":0.05,"decision":"SHIP"}
 
 # 4. argmax ships: the winner's text goes to the response verbatim.
 #    If decision is NO_RESULT (exit 3), do NOT ship — re-run or merge.
@@ -99,9 +100,18 @@ Jev auth: the credential is already stored for `~/bin/jevq` (connector
   `--json` (pure JSON). TOON output embeds a `# json:` line parseable via
   `grep '^# json: ' | sed 's/^# json: //' | jq .`
 - **`bin/v2-score`** — scores candidates with one `jevq --batch` call.
-  Skips empty texts, requires ≥ 2 valid candidates, applies the
-  discrimination threshold (default 0.05): top-two gap below it →
-  `NO_RESULT`, exit 3. Emits score JSON; `--ledger` appends the audit line.
+  The grader stage is independent: its own timeout (default 120s, TERM then
+  hard-KILL 10s later), exit 4 on failure, and candidate-generation
+  timeouts never cascade into it — scoring proceeds with the candidates
+  that finished (≥ 2 required). The raw unmodified Jev p's are captured
+  first (stderr, `--scores-out`, ledger) before any grade multiplication
+  or threshold logic. Kelly split: final rank = Jev p × `--grades`
+  multiplier (each grade in (0,1], default 1.0); the discrimination
+  threshold (default 0.05) applies to the final scores: top-two gap below
+  it → `NO_RESULT`, exit 3. Emits
+  `{"raw_scores":..,"grades":..,"scores":..,"winner":..,"margin":..,
+  "threshold":..,"decision":..}`; `--ledger` appends the audit line
+  (raw scores AND decision, always).
 - **`bin/v2-ledger`** — appends one JSONL audit line (prompt sha, never the
   prompt) to the protocol ledger.
 - **`lib/guardrails.sh`** — shared validation: slot range, prompt length,
@@ -140,6 +150,38 @@ either re-run with sharper contrasting variables or merge the finalists.
 Crowning noise as "the right answer" is the most common way this pattern
 lies to you.
 
+## Scoring: Kelly split (p from Jev, b from the grade)
+
+Final rank score per candidate = **Jev p × grade**, split like the Kelly
+criterion: Jev provides the gut probability, a separate grade provides the
+multiplier (the b risk-discount, net odds).
+
+- **p comes only from Jev.** The raw, unmodified `noul` probability per
+  candidate — the first preference — is captured before anything else
+  touches it: printed to stderr, written to `--scores-out`, and stored in
+  the ledger alongside the final decision. It is never recomputed or lost
+  to downstream adjustments.
+- **b comes only from the grade.** Each grade is a number in (0,1],
+  derived from additional factors *outside* Jev: discrimination-margin
+  history, candidate timeout history, test/verification results
+  (`git apply --check`, test suites), cost/latency budgets. It is never
+  sourced from Jev — p and b are never mixed at the source.
+- Without `--grades`, every grade defaults to 1.0: pure Jev ranking.
+
+```bash
+bin/v2-score --candidates candidates.json \
+  --grades '{"1":0.9,"2":0.7}' \
+  --scores-out raw.json \
+  --ledger ledger.jsonl
+# -> {"raw_scores":{"1":0.81,...},"grades":{"1":0.9,...},"scores":{"1":0.729,...},
+#     "winner":1,"margin":0.06,"threshold":0.05,"decision":"SHIP"}
+```
+
+The grader stage is independent: it has its own timeout (default 120s,
+hard-kill 10s after TERM) and exits 4 on failure — candidate-generation
+timeouts never cascade into scoring, which proceeds with the candidates
+that finished (minimum 2). See `CONSTRAINTS.md`.
+
 ## Weaknesses (read before trusting this)
 
 1. **No quality floor.** Jev picks the best of N, but if all N are bad, the
@@ -160,10 +202,12 @@ lies to you.
    pass. A 15-1 validation run picked the same winner as 3-1-1 at ~3× the
    spend. 1-N-1 is a *quality* shape, not a cheap one — use the max-slots
    cap and the warn threshold.
-6. **Latency.** Stages are sequential: candidates → score → ship. One hung
-   candidate blocks everything without a timeout. Set `--timeout` and
-   document the degraded path (judge proceeds with the candidates that
-   returned).
+6. **Latency.** Stages are sequential: candidates → score → ship. A hung
+   candidate used to block everything; the fan-out stage still needs its
+   own per-candidate timeout, but the grader stage is now independent —
+   it has its own bounded timeout (TERM then hard-KILL, exit 4) and never
+   waits on candidate generation. Document the degraded path (judge
+   proceeds with the candidates that returned).
 7. **"Only subagent voices speak" is load-bearing theater.** The
    orchestrator authors every prompt, picks every variable, frames every
    question — it is the author of everything while claiming authorship of
@@ -181,6 +225,13 @@ lies to you.
     coordination, shared state, and ordering — the opposite of stateless
     candidates. Use this pattern for *judgment* (which answer is best),
     not for *division of labor*.
+11. **Grade gaming.** Whoever sets the `--grades` controls the outcome:
+    a grade of 0.1 on the Jev favorite silently crowns the runner-up, and
+    nothing in the protocol distinguishes a principled risk discount from
+    a thumb on the scale. Grades are a second judgment surface — log them
+    in the ledger (done automatically), keep the raw Jev p's visible
+    (done automatically), and treat any grade < 1.0 as a claim that needs
+    its own audit trail: which factor, measured how.
 
 What converts the pattern from theater to something real: thresholds that
 can return NO_RESULT, an audit ledger so "trust the process" is checkable
@@ -203,6 +254,7 @@ substitution, prompt hashed (never echoed), variable cycling.
 ```
 speculative-151/
 ├── README.md            # this file
+├── CONSTRAINTS.md       # operational rules: independent grader, raw-first scores, Kelly split
 ├── spec/v2-1-5-1.toon   # canonical declarative spec
 ├── bin/v2-scaffold      # dispatch-spec CLI (TOON/JSON)
 ├── bin/v2-score         # jevq batch scorer + argmax + threshold gate

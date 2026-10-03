@@ -37,6 +37,22 @@ and the winner ships the strongest change — not the best-sounding
 description of one. Broken hunks can be rejected before anything touches
 the tree: validate with `git apply --check` before scoring.
 
+Fold verification into the judgment with the Kelly split: Jev provides the
+gut p on the diff, and `--grades` provides the risk multiplier b from
+factors Jev can't see. A natural grading for patch candidates:
+
+```bash
+# grade 1.0 = hunk applies cleanly AND tests pass; discount otherwise
+v2-score --candidates diffs.json \
+  --question "Is this the best code change? Judge correctness, minimality, and risk." \
+  --grades '{"1":1.0,"2":0.6}' \
+  --threshold 0.05 \
+  --ledger ledger.jsonl
+```
+
+p comes only from Jev; b comes only from your verification factors —
+never mixed. See `CONSTRAINTS.md` §5.
+
 ## Why patches, not prose
 
 - The judge sees what will actually land in the repo.

@@ -30,11 +30,13 @@ decode[1]{stage,input,call,select,emit,threshold}:
 parallel_edits{mode,output,grade}:
   git-patch,unified diff per candidate,jev noul "Is this the best change?" over diffs
 
-# guardrails (see lib/guardrails.sh, bin/v2-scaffold, bin/v2-score)
+# guardrails (see CONSTRAINTS.md, lib/guardrails.sh, bin/v2-scaffold, bin/v2-score)
 guardrails{rule,value,reason}:
   min_slots,2,N=1 has nothing to judge; argmax is a no-op
   max_slots,25,cost control; warn above 10
   prompt_max_chars,8000,bound jevq input cost
-  candidate_timeout_s,120,judge never waits indefinitely
-  discrimination_threshold,0.05,top-two gap below this -> NO_RESULT not a crowned tie
-  ledger,ledger.jsonl,every run appends prompt hash + scores + winner; trust is checkable
+  grader_timeout_s,120,independent stage: TERM then hard-KILL +10s; exit 4; fan-out timeouts never cascade
+  raw_scores_first,always,unmodified Jev p emitted (stderr/scores-out/ledger) before grades or thresholds
+  kelly_split,p x grade,p only from Jev; grade b in (0,1] only from external factors; default 1.0
+  discrimination_threshold,0.05,top-two FINAL gap below this -> NO_RESULT not a crowned tie
+  ledger,ledger.jsonl,every run appends prompt hash + raw scores + grades + decision; trust is checkable

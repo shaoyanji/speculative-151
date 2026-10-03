@@ -65,3 +65,16 @@ guard_threshold() {
 prompt_sha() {
   printf '%s' "$1" | sha256sum | awk '{print $1}'
 }
+
+# guard_grade G -> validated grade on stdout; must be a number in (0,1].
+# The grade is the Kelly multiplier b: a risk discount from factors OUTSIDE
+# Jev (timeout history, test results, cost, discrimination margin). It is
+# never sourced from Jev itself — p and b stay separate.
+guard_grade() {
+  local g="${1:-}"
+  [[ "$g" =~ ^[0-9]*\.?[0-9]+$ ]] || {
+    echo "error: grade must be a number in (0,1], got '$g'" >&2; return 2; }
+  awk -v g="$g" 'BEGIN{exit !(g > 0 && g <= 1)}' || {
+    echo "error: grade must be in (0,1], got '$g'" >&2; return 2; }
+  printf '%s' "$g"
+}
