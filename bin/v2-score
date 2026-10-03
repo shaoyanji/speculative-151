@@ -10,7 +10,9 @@
 #   grades     = per-candidate risk multiplier in (0,1] (default 1.0).
 #   scores     = final rank scores = raw p x grade (Kelly split).
 # Exit 0 on SHIP, 3 on NO_RESULT (top-two final gap < threshold: do not crown a tie),
-# 2 on usage/validation errors, 4 if jevq failed or timed out.
+# 2 on usage/validation errors, 4 if jevq failed, timed out, or returned a
+# malformed/unusable batch response (no answers object, non-numeric or
+# out-of-range noul, or fewer than 2 candidates scored).
 #
 # Independence: the jevq batch call has its OWN timeout (default 120s, hard-kill
 # 10s after TERM). A grader timeout/failure exits 4 immediately — it never hangs,
@@ -140,13 +142,46 @@ else
   fi
 fi
 
-# --- RAW FIRST SCORE: unmodified Jev p's, captured BEFORE anything else. ----
-# This is the gut probability. It is emitted now — stderr, --scores-out,
-# ledger — and is never recomputed or lost to downstream adjustments.
-jq -c '
-  (.answers // {}) | with_entries(.value |= (.noul // 0))
-' "$TMPDIR_WORK/resp.json" > "$TMPDIR_WORK/raw.json"
+# --- GRADER VALIDATION: the judge's response must be usable. -----------------
+# Independence means the grader stage fails LOUD, never silent. Immediately
+# after the bounded jevq call we validate, in this order:
+#   1. the response is JSON carrying an `answers` object      -> else exit 4
+#   2. every scored expected slot has numeric noul in [0,1]   -> else exit 4
+#   3. at least 2 of the known candidate slots were scored    -> else exit 4
+# Phantom ids (slots the judge invented) are dropped: only expected slots
+# are carried forward into the raw scores. Validation exits BEFORE raw-score
+# emission — there are no valid raw scores to emit yet; raw-first capture
+# still holds in the sense that the raw p's are recorded before any grade
+# math or thresholding below.
+VALID_OUT=""
+if ! VALID_OUT="$(jq -c --slurpfile c "$TMPDIR_WORK/cands.json" '
+    ($c[0] | map(.slot | tostring)) as $slots
+    | (.answers // null) as $a
+    | if ($a | type) != "object" then {ok:false, err:"no answers object"}
+      else
+        (reduce $slots[] as $s ({"raw":{}, "scored":0, "bad":null};
+          (($a[$s] // null) | if type == "object" then .noul else null end) as $p
+          | if $p == null then .
+            elif ($p | type) != "number" then .bad = "non-numeric noul for slot \($s)"
+            elif $p < 0 or $p > 1 then .bad = "noul out of [0,1] for slot \($s): \($p)"
+            else .raw[$s] = $p | .scored += 1 end)
+        | if .bad != null then {ok:false, err:.bad}
+          elif .scored < 2 then {ok:false, err:"\(.scored) of \($slots | length) candidates scored; need >= 2"}
+          else {ok:true, raw:.raw} end)
+      end
+  ' "$TMPDIR_WORK/resp.json" 2>/dev/null)" \
+  || [[ "$(printf '%s' "$VALID_OUT" | jq -r '.ok // false' 2>/dev/null)" != "true" ]]; then
+  VERR="$(printf '%s' "$VALID_OUT" | jq -r '.err // "unparseable response"' 2>/dev/null)"
+  [[ -n "$VERR" ]] || VERR="unparseable response"
+  echo "error: malformed jevq batch response: ${VERR} (grader failure; exit 4)" >&2
+  exit 4
+fi
+printf '%s\n' "$VALID_OUT" | jq -c '.raw' > "$TMPDIR_WORK/raw.json"
 
+# --- RAW FIRST SCORE: unmodified Jev p's, captured BEFORE anything else. ----
+# This is the gut probability (validated above). It is emitted now — stderr,
+# --scores-out, ledger — and is never recomputed or lost to downstream
+# adjustments.
 echo "raw_scores: $(cat "$TMPDIR_WORK/raw.json")" >&2
 if [[ -n "$SCORES_OUT" ]]; then
   cp "$TMPDIR_WORK/raw.json" "$SCORES_OUT"

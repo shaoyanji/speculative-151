@@ -34,6 +34,10 @@ Long cascading timeouts paralyzing the grader was a real failure mode:
 one hung candidate used to stall the whole pipeline. That is fixed by
 construction now — the judge never waits on the fan-out.
 
+The same loud-failure rule mirrors at the grader stage: if Jev scores
+fewer than 2 candidates, or its response is unusable, that is a grader
+failure (exit 4) — never a single-candidate "winner".
+
 ## 4. Always capture the raw first Jev score
 The unmodified first-preference `noul` probabilities — the gut p per
 candidate — are emitted BEFORE any grade multiplication, discounting, or
